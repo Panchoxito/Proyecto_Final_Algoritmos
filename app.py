@@ -5,6 +5,16 @@ from tkinter import ttk, messagebox, filedialog
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from email.message import EmailMessage
+import datetime
+
+
+def obtener_ruta_excel():
+    """Devuelve una ruta ABSOLUTA para el archivo de ventas.
+    Usa la variable global 'ruta_excel' si existe; si no, 'Ventas.xlsx'."""
+    import os
+    base = globals().get('ruta_excel', 'Ventas.xlsx')
+    carpeta = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(carpeta, base)
 
 ruta_excel = 'Ventas.xlsx'
 
@@ -263,71 +273,299 @@ def listar_ventas():
         datos.append(list(fila))
     return datos
 
-def crear_venta(codigo_producto, codigo_cliente, cantidad):
-    try: cantidad = float(cantidad)
-    except: return False, 'La cantidad debe ser numérica'
-    if cantidad <= 0: return False, 'La cantidad debe ser mayor que cero'
-    prod = obtener_producto(codigo_producto); 
-    if not prod: return False, 'Producto no existe'
-    cli = obtener_cliente(codigo_cliente); 
-    if not cli: return False, 'Cliente no existe'
-    if float(prod['existencia']) < cantidad: return False, 'No hay existencia suficiente'
-    total = float(prod['precio']) * cantidad
-    wb, sh = obtener_hoja('ventas'); ultimo_id = 0
-    for i, fila in enumerate(sh.iter_rows(values_only=True)):
-        if i == 0: continue
-        if fila and fila[0]:
-            try: ultimo_id = max(ultimo_id, int(str(fila[0]).split('-')[-1]))
-            except: pass
-    nuevo_id = f'VE-{ultimo_id+1}'
+
+def crear_venta(codigo_producto, codigo_cliente, cantidad_str):
+    """Inserta una venta en Excel de forma robusta y sin bloquear por detalles menores."""
+    from openpyxl import load_workbook, Workbook
+    import os, datetime
+
+    # Normalizar cantidad (permitir coma decimal)
+    try:
+        s = str(cantidad_str).strip().replace(',', '.')
+        cantidad = float(s)
+    except Exception:
+        return False, 'La cantidad debe ser numérica.'
+    if cantidad <= 0:
+        return False, 'La cantidad debe ser mayor que cero.'
+
+    # Asegurar libro y ruta
+    asegurar_excel()
+    ruta = obtener_ruta_excel()
+    try:
+        wb = load_workbook(ruta)
+    except Exception:
+        wb = Workbook()
+    ws = wb['ventas'] if 'ventas' in wb.sheetnames else wb.create_sheet('ventas')
+    # Encabezados si faltan
+    if ws.max_row == 1 and (ws.cell(row=1, column=1).value is None or str(ws.cell(row=1, column=1).value).lower() != 'id'):
+        ws.delete_rows(1, ws.max_row)
+        ws.append(['id','codigo_producto','codigo_cliente','cantidad','total','fecha','estado'])
+
+    # Obtener precio: 1) via helper 2) via hoja productos
+    precio = None
+    try:
+        prod = obtener_producto(codigo_producto)
+        if isinstance(prod, dict) and 'precio' in prod:
+            precio = float(str(prod['precio']).replace(',', '.'))
+    except Exception:
+        pass
+    if precio is None:
+        # Buscar en hoja productos: columnas esperadas [id_ai,codigo,nombre,existencia,proveedor,precio]
+        try:
+            wb2 = wb  # mismo libro si compartido
+            hoja_prod = wb2['productos'] if 'productos' in wb2.sheetnames else None
+            if hoja_prod:
+                for i, row in enumerate(hoja_prod.iter_rows(values_only=True), start=1):
+                    if i == 1:
+                        continue
+                    if row and str(row[1]) == str(codigo_producto):
+                        try:
+                            precio = float(str(row[5]).replace(',', '.'))
+                        except Exception:
+                            precio = 0.0
+                        break
+        except Exception:
+            precio = 0.0
+    if precio is None:
+        precio = 0.0
+
+    total = round(precio * cantidad, 2)
     fecha = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    sh.append([nuevo_id, codigo_producto, codigo_cliente, float(cantidad), round(total,2), fecha, 'activa'])
-    wb_prod, hoja_prod = obtener_hoja('productos')
-    for idx, fila in enumerate(hoja_prod.iter_rows(values_only=True), start=1):
-        if idx == 1: continue
-        if fila and str(fila[1]) == str(codigo_producto):
-            hoja_prod.cell(row=idx, column=4).value = float(fila[3]) - cantidad; break
-    guardar_libro(wb); guardar_libro(wb_prod); return True, 'Venta creada'
+    estado = 'activa'
+
+    # id = max(ids) + 1 (ignorando encabezado y filas vacías)
+    max_id = 0
+    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if i == 1:
+            continue
+        if not row or row[0] is None:
+            continue
+        try:
+            cur = int(str(row[0]).strip())
+            if cur > max_id:
+                max_id = cur
+        except Exception:
+            continue
+    next_id = max_id + 1
+
+    # Escribir fila
+    ws.append([next_id, codigo_producto, codigo_cliente, cantidad, total, fecha, estado])
+
+    # Guardar con fallback
+    try:
+        wb.save(ruta)
+    except PermissionError:
+        ruta_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Ventas_local.xlsx')
+        wb.save(ruta_local)
+        globals()['ruta_excel'] = 'Ventas_local.xlsx'
+
+    return True, 'Venta creada correctamente.'
+
 
 def anular_venta(id_venta):
-    wb, sh = obtener_hoja('ventas'); fila_editar = None; datos = None
+    """Marca una venta como 'anulada' y devuelve el stock al producto.
+    Columnas ventas: [id, codigo_producto, codigo_cliente, cantidad, total, fecha, estado]
+    Columnas productos: [id_ai,codigo,nombre,existencia,proveedor,precio]
+    """
+    wb, sh = obtener_hoja('ventas')
+    fila_editar = None
+    datos = None
     for idx, fila in enumerate(sh.iter_rows(values_only=True), start=1):
-        if idx == 1: continue
-        if fila and str(fila[0]) == str(id_venta): fila_editar = idx; datos = fila; break
-    if not fila_editar: return False, 'No encontrada'
-    if sh.cell(row=fila_editar, column=7).value == 'anulada': return False, 'Ya anulada'
+        if idx == 1:
+            continue
+        if fila and str(fila[0]) == str(id_venta):
+            fila_editar = idx
+            datos = list(fila)
+            break
+    if not fila_editar:
+        return False, 'No encontrada'
+    estado_actual = str(sh.cell(row=fila_editar, column=7).value or '').lower()
+    if estado_actual == 'anulada':
+        return False, 'Ya anulada'
+
+    # Marcar anulada
     sh.cell(row=fila_editar, column=7).value = 'anulada'
-    wb_prod, hoja_prod = obtener_hoja('productos')
-    for idx, fila in enumerate(hoja_prod.iter_rows(values_only=True), start=1):
-        if idx == 1: continue
-        if fila and str(fila[1]) == str(datos[1]): hoja_prod.cell(row=idx, column=4).value = float(fila[3]) + float(datos[3]); break
-    guardar_libro(wb); guardar_libro(wb_prod); return True, 'Venta anulada'
+
+    # Devolver stock
+    try:
+        cod_prod = datos[1]
+        cant = float(datos[3] or 0)
+    except Exception:
+        cod_prod = datos[1] if datos else None
+        cant = 0.0
+
+    if cant > 0 and cod_prod is not None:
+        wb_prod, hoja_prod = obtener_hoja('productos')
+        for r, f in enumerate(hoja_prod.iter_rows(values_only=True), start=1):
+            if r == 1:
+                continue
+            if f and str(f[1]) == str(cod_prod):
+                try:
+                    existencia = float(f[3] or 0)
+                except Exception:
+                    existencia = 0.0
+                hoja_prod.cell(row=r, column=4).value = existencia + cant
+                guardar_libro(wb_prod)
+                break
+
+    guardar_libro(wb)
+    return True, 'Venta anulada'
 
 def generar_reporte_por_cliente(ruta_salida):
-    ventas = listar_ventas(); mapa = {}
+    """Genera un reporte Excel estético de ventas por cliente."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ventas = listar_ventas()
+    mapa = {}
     for v in ventas:
-        if v[6] != 'activa': continue
-        cli = obtener_cliente(v[2]); nombre = cli['nombre'] if cli else v[2]
-        if nombre not in mapa: mapa[nombre] = {'cantidad':0,'total':0}
-        mapa[nombre]['cantidad'] += float(v[3]); mapa[nombre]['total'] += float(v[4])
-    wb_out = Workbook(); ws = wb_out.active; ws.title = 'ventas_por_cliente'
-    ws.append(['cliente','cantidad','total'])
-    for k, val in mapa.items(): ws.append([k, val['cantidad'], round(val['total'],2)])
-    for c in range(1,4): ws.column_dimensions[get_column_letter(c)].width = 24
-    wb_out.save(ruta_salida)
+        try:
+            if str(v[6]).lower() != 'activa':
+                continue
+        except Exception:
+            pass
+        cli = obtener_cliente(v[2])
+        nombre = cli['nombre'] if cli else str(v[2])
+        if nombre not in mapa:
+            mapa[nombre] = {'cantidad': 0.0, 'total': 0.0}
+        try:
+            mapa[nombre]['cantidad'] += float(v[3] or 0)
+            mapa[nombre]['total'] += float(v[4] or 0)
+        except Exception:
+            pass
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'ventas_por_cliente'
+
+    # Title
+    ws.merge_cells('A1:C1')
+    ws['A1'] = 'Ventas por Cliente'
+    ws['A1'].font = Font(bold=True, size=14)
+    ws['A1'].alignment = Alignment(horizontal='center')
+
+    # Headers
+    headers = ['Cliente', 'Cantidad', 'Total (Q)']
+    ws.append(headers)  # row 2 will be overwritten below to ensure styles
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=2, column=i, value=h)
+        c.font = Font(bold=True)
+        c.fill = PatternFill('solid', fgColor='D9E1F2')
+        c.alignment = Alignment(horizontal='center')
+
+    # Data
+    row = 3
+    for nombre, agg in sorted(mapa.items(), key=lambda kv: kv[0].lower()):
+        ws.cell(row=row, column=1, value=nombre)
+        ws.cell(row=row, column=2, value=round(agg['cantidad'], 2))
+        ctot = ws.cell(row=row, column=3, value=round(agg['total'], 2))
+        ctot.number_format = '#,##0.00'
+        if row % 2 == 1:
+            for col in range(1, 4):
+                ws.cell(row=row, column=col).fill = PatternFill('solid', fgColor='F5F5F5')
+        row += 1
+
+    # Totals row
+    if row > 3:
+        ws.cell(row=row, column=1, value='TOTAL').font = Font(bold=True)
+        ws.cell(row=row, column=2, value=f"=SUM(B3:B{row-1})").font = Font(bold=True)
+        ct = ws.cell(row=row, column=3, value=f"=SUM(C3:C{row-1})")
+        ct.font = Font(bold=True); ct.number_format = '#,##0.00'
+
+    # Borders
+    thin = Side(style='thin', color='BFBFBF')
+    for r in range(2, row+1):
+        for c in range(1, 4):
+            ws.cell(row=r, column=c).border = Border(top=thin, left=thin, right=thin, bottom=thin)
+
+    # Column widths
+    for c in range(1, 4):
+        ws.column_dimensions[get_column_letter(c)].width = 26
+
+    # Freeze panes and filter
+    ws.freeze_panes = 'A3'
+    ws.auto_filter.ref = f"A2:C{row}"
+
+    wb.save(ruta_salida)
 
 def generar_reporte_por_producto(ruta_salida):
-    ventas = listar_ventas(); mapa = {}
+    """Genera un reporte Excel estético de ventas por producto."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ventas = listar_ventas()
+    mapa = {}
     for v in ventas:
-        if v[6] != 'activa': continue
-        prod = obtener_producto(v[1]); nombre = prod['nombre'] if prod else v[1]
-        if nombre not in mapa: mapa[nombre] = {'cantidad':0,'total':0}
-        mapa[nombre]['cantidad'] += float(v[3]); mapa[nombre]['total'] += float(v[4])
-    wb_out = Workbook(); ws = wb_out.active; ws.title = 'ventas_por_producto'
-    ws.append(['producto','cantidad','total'])
-    for k, val in mapa.items(): ws.append([k, val['cantidad'], round(val['total'],2)])
-    for c in range(1,4): ws.column_dimensions[get_column_letter(c)].width = 24
-    wb_out.save(ruta_salida)
+        try:
+            if str(v[6]).lower() != 'activa':
+                continue
+        except Exception:
+            pass
+        prod = obtener_producto(v[1])
+        nombre = prod['nombre'] if prod else str(v[1])
+        if nombre not in mapa:
+            mapa[nombre] = {'cantidad': 0.0, 'total': 0.0}
+        try:
+            mapa[nombre]['cantidad'] += float(v[3] or 0)
+            mapa[nombre]['total'] += float(v[4] or 0)
+        except Exception:
+            pass
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'ventas_por_producto'
+
+    # Title
+    ws.merge_cells('A1:C1')
+    ws['A1'] = 'Ventas por Producto'
+    ws['A1'].font = Font(bold=True, size=14)
+    ws['A1'].alignment = Alignment(horizontal='center')
+
+    # Headers
+    headers = ['Producto', 'Cantidad', 'Total (Q)']
+    ws.append(headers)
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=2, column=i, value=h)
+        c.font = Font(bold=True)
+        c.fill = PatternFill('solid', fgColor='D9E1F2')
+        c.alignment = Alignment(horizontal='center')
+
+    # Data
+    row = 3
+    for nombre, agg in sorted(mapa.items(), key=lambda kv: kv[0].lower()):
+        ws.cell(row=row, column=1, value=nombre)
+        ws.cell(row=row, column=2, value=round(agg['cantidad'], 2))
+        ctot = ws.cell(row=row, column=3, value=round(agg['total'], 2))
+        ctot.number_format = '#,##0.00'
+        if row % 2 == 1:
+            for col in range(1, 4):
+                ws.cell(row=row, column=col).fill = PatternFill('solid', fgColor='F5F5F5')
+        row += 1
+
+   
+    if row > 3:
+        ws.cell(row=row, column=1, value='TOTAL').font = Font(bold=True)
+        ws.cell(row=row, column=2, value=f"=SUM(B3:B{row-1})").font = Font(bold=True)
+        ct = ws.cell(row=row, column=3, value=f"=SUM(C3:C{row-1})")
+        ct.font = Font(bold=True); ct.number_format = '#,##0.00'
+
+    
+    thin = Side(style='thin', color='BFBFBF')
+    for r in range(2, row+1):
+        for c in range(1, 4):
+            ws.cell(row=r, column=c).border = Border(top=thin, left=thin, right=thin, bottom=thin)
+
+    
+    for c in range(1, 4):
+        ws.column_dimensions[get_column_letter(c)].width = 26
+
+    
+    ws.freeze_panes = 'A3'
+    ws.auto_filter.ref = f"A2:C{row}"
+
+    wb.save(ruta_salida)
 
 class App(Tk):
     def __init__(self):
@@ -388,12 +626,11 @@ class App(Tk):
         cuaderno.add(self.tab_clientes, text='Clientes')
         cuaderno.add(self.tab_ventas, text='Ventas')
         cuaderno.add(self.tab_reportes, text='Reportes')
-        cuaderno.add(self.tab_correo, text='Correo')
         self.ui_productos()
         self.ui_clientes()
         self.ui_ventas()
         self.ui_reportes()
-        self.ui_correo()
+        
 
     def ui_productos(self):
         sup = ttk.Frame(self.tab_productos); sup.pack(fill='x')
@@ -470,18 +707,17 @@ class App(Tk):
         self.refrescar_combobox(); self.refrescar_ventas()
 
 
-        # --- Panel inferior: Venta reciente ---
+      
         ttk.Separator(self.tab_ventas, orient='horizontal').pack(fill='x', pady=6)
         self.panel_venta = ttk.Frame(self.tab_ventas, padding=10)
         self.panel_venta.pack(fill='x')
 
         ttk.Label(self.panel_venta, text='Venta reciente', style='Sub.TLabel').grid(row=0, column=0, columnspan=8, sticky='w', pady=(0,6))
 
-        # Variables para mostrar detalle
         self.v_id = StringVar(); self.v_prod = StringVar(); self.v_cli = StringVar()
         self.v_cant = StringVar(); self.v_total = StringVar(); self.v_fecha = StringVar(); self.v_estado = StringVar()
 
-        # Encabezados
+      
         ttk.Label(self.panel_venta, text='ID:').grid(row=1, column=0, sticky='e', padx=(0,4))
         ttk.Label(self.panel_venta, text='Producto:').grid(row=1, column=2, sticky='e', padx=(12,4))
         ttk.Label(self.panel_venta, text='Cliente:').grid(row=1, column=4, sticky='e', padx=(12,4))
@@ -491,7 +727,7 @@ class App(Tk):
         ttk.Label(self.panel_venta, text='Fecha:').grid(row=2, column=4, sticky='e', padx=(12,4), pady=(4,0))
         ttk.Label(self.panel_venta, text='Estado:').grid(row=2, column=6, sticky='e', padx=(12,4), pady=(4,0))
 
-        # Valores
+        
         ttk.Label(self.panel_venta, textvariable=self.v_id).grid(row=1, column=1, sticky='w')
         ttk.Label(self.panel_venta, textvariable=self.v_prod).grid(row=1, column=3, sticky='w')
         ttk.Label(self.panel_venta, textvariable=self.v_cli).grid(row=1, column=5, sticky='w')
@@ -504,7 +740,7 @@ class App(Tk):
         for i in range(8):
             self.panel_venta.columnconfigure(i, weight=1)
 
-        # Iniciar con última venta si existe
+     
             self.actualizar_detalle_venta_desde_ultima()
     def ui_reportes(self):
         cont = ttk.Frame(self.tab_reportes, padding=10); cont.pack(fill='x', pady=10)
@@ -582,7 +818,7 @@ class App(Tk):
             ok, msg = eliminar_producto(vals[0]); messagebox.showinfo('Info', msg)
             if ok: self.refrescar_productos()
 
-    # --- Clientes (acciones y utilidades)
+    
     def ordenar_tabla(self, tv, col, descendente):
         datos = [(tv.set(k, col), k) for k in tv.get_children('')]
         try: datos.sort(key=lambda t: float(t[0]), reverse=descendente)
@@ -749,27 +985,7 @@ class App(Tk):
         if not ruta: return
         generar_reporte_por_producto(ruta); self.archivo_rep_producto.set(ruta); messagebox.showinfo('Listo','Reporte generado')
 
-    def enviar_reportes(self):
-        correo = getattr(self, 'ent_correo', None).get().strip()
-        clave = getattr(self, 'ent_pass', None).get().strip()
-        destino = getattr(self, 'ent_destino', None).get().strip()
-        adjuntos = []
-        if getattr(self, 'archivo_rep_cliente', None) and self.archivo_rep_cliente.get(): adjuntos.append(self.archivo_rep_cliente.get())
-        if getattr(self, 'archivo_rep_producto', None) and self.archivo_rep_producto.get(): adjuntos.append(self.archivo_rep_producto.get())
-        if not correo or not clave or not destino or not adjuntos:
-            messagebox.showwarning('Atención','Complete correo, contraseña, destino y genere al menos un reporte'); return
-        try:
-            msg = EmailMessage(); msg['Subject'] = 'Reportes de Ventas'; msg['From'] = correo; msg['To'] = destino
-            msg.set_content('Se adjuntan los reportes solicitados.')
-            for ruta in adjuntos:
-                with open(ruta, 'rb') as f: datos = f.read()
-                msg.add_attachment(datos, maintype='application', subtype='octet-stream', filename=os.path.basename(ruta))
-            contexto = ssl.create_default_context()
-            with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=contexto) as server:
-                server.login(correo, clave); server.send_message(msg)
-            self.estado_correo.set('Enviado'); messagebox.showinfo('Listo','Correo enviado')
-        except Exception as e:
-            self.estado_correo.set('Error'); messagebox.showerror('Error', str(e))
+   
 
 if __name__ == '__main__':
     asegurar_excel()
